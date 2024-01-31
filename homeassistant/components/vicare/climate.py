@@ -142,7 +142,10 @@ class ViCareClimate(ViCareEntity, ClimateEntity):
 
     _attr_precision = PRECISION_TENTHS
     _attr_supported_features = (
-        ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
+        ClimateEntityFeature.TARGET_TEMPERATURE
+        | ClimateEntityFeature.PRESET_MODE
+        | ClimateEntityFeature.TURN_OFF
+        | ClimateEntityFeature.TURN_ON
     )
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_min_temp = VICARE_TEMP_HEATING_MIN
@@ -311,8 +314,12 @@ class ViCareClimate(ViCareEntity, ClimateEntity):
             )
 
         _LOGGER.debug("Current preset %s", self._current_program)
-        if self._current_program and self._current_program != VICARE_PROGRAM_NORMAL:
-            # We can't deactivate "normal"
+        if self._current_program and self._current_program not in [
+            VICARE_PROGRAM_NORMAL,
+            VICARE_PROGRAM_REDUCED,
+            VICARE_PROGRAM_STANDBY,
+        ]:
+            # We can't deactivate "normal", "reduced" or "standby"
             _LOGGER.debug("deactivating %s", self._current_program)
             try:
                 self._circuit.deactivateProgram(self._current_program)
@@ -326,8 +333,12 @@ class ViCareClimate(ViCareEntity, ClimateEntity):
                 ) from err
 
         _LOGGER.debug("Setting preset to %s / %s", preset_mode, target_program)
-        if target_program != VICARE_PROGRAM_NORMAL:
-            # And we can't explicitly activate "normal", either
+        if target_program not in [
+            VICARE_PROGRAM_NORMAL,
+            VICARE_PROGRAM_REDUCED,
+            VICARE_PROGRAM_STANDBY,
+        ]:
+            # And we can't explicitly activate "normal", "reduced" or "standby", either
             _LOGGER.debug("activating %s", target_program)
             try:
                 self._circuit.activateProgram(target_program)

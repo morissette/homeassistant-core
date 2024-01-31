@@ -6,13 +6,13 @@ import asyncio
 from collections import deque
 from collections.abc import Callable, Coroutine, Iterable, Mapping, MutableMapping
 import dataclasses
-from datetime import timedelta
-from enum import Enum, auto
+from enum import Enum, IntFlag, auto
 import functools as ft
 import logging
 import math
 import sys
 from timeit import default_timer as timer
+from types import FunctionType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -43,7 +43,13 @@ from homeassistant.const import (
     STATE_UNKNOWN,
     EntityCategory,
 )
-from homeassistant.core import CALLBACK_TYPE, Context, HomeAssistant, callback
+from homeassistant.core import (
+    CALLBACK_TYPE,
+    Context,
+    HomeAssistant,
+    callback,
+    get_release_channel,
+)
 from homeassistant.exceptions import (
     HomeAssistantError,
     InvalidStateError,
@@ -81,7 +87,7 @@ FLOAT_PRECISION = abs(int(math.floor(math.log10(abs(sys.float_info.epsilon))))) 
 # How many times per hour we allow capabilities to be updated before logging a warning
 CAPABILITIES_UPDATE_LIMIT = 100
 
-CONTEXT_RECENT_TIME = timedelta(seconds=5)  # Time that a context is considered recent
+CONTEXT_RECENT_TIME_SECONDS = 5  # Time that a context is considered recent
 
 
 @callback
@@ -227,6 +233,9 @@ class EntityPlatformState(Enum):
     REMOVED = auto()
 
 
+_SENTINEL = object()
+
+
 class EntityDescription(metaclass=FrozenOrThawed, frozen_or_thawed=True):
     """A class that describes Home Assistant entities."""
 
@@ -242,6 +251,7 @@ class EntityDescription(metaclass=FrozenOrThawed, frozen_or_thawed=True):
     has_entity_name: bool = False
     name: str | UndefinedType | None = UNDEFINED
     translation_key: str | None = None
+    translation_placeholders: Mapping[str, str] | None = None
     unit_of_measurement: str | None = None
 
 
@@ -289,7 +299,7 @@ class CachedProperties(type):
         Pop cached_properties and store it in the namespace.
         """
         namespace["_CachedProperties__cached_properties"] = cached_properties or set()
-        return super().__new__(mcs, name, bases, namespace)
+        return super().__new__(mcs, name, bases, namespace, **kwargs)
 
     def __init__(
         cls,
@@ -346,6 +356,8 @@ class CachedProperties(type):
                 Also invalidates the corresponding cached_property by calling
                 delattr on it.
                 """
+                if getattr(o, private_attr_name, _SENTINEL) == val:
+                    return
                 setattr(o, private_attr_name, val)
                 try:  # noqa: SIM105  suppress is much slower
                     delattr(o, name)
@@ -369,6 +381,9 @@ class CachedProperties(type):
             # Check if an _attr_ class attribute exits and move it to __attr_. We check
             # __dict__ here because we don't care about _attr_ class attributes in parents.
             if attr_name in cls.__dict__:
+                attr = getattr(cls, attr_name)
+                if isinstance(attr, (FunctionType, property)):
+                    raise TypeError(f"Can't override {attr_name} in subclass")
                 setattr(cls, private_attr_name, getattr(cls, attr_name))
                 annotations = cls.__annotations__
                 if attr_name in annotations:
@@ -424,6 +439,7 @@ CACHED_PROPERTIES_WITH_ATTR_ = {
     "state",
     "supported_features",
     "translation_key",
+    "translation_placeholders",
     "unique_id",
     "unit_of_measurement",
 }
@@ -455,6 +471,9 @@ class Entity(
     # If we reported if this entity was slow
     _slow_reported = False
 
+    # If we reported deprecated supported features constants
+    _deprecated_supported_features_reported = False
+
     # If we reported this entity is updated while disabled
     _disabled_reported = False
 
@@ -464,6 +483,9 @@ class Entity(
 
     # If we reported this entity was added without its platform set
     _no_platform_reported = False
+
+    # If we reported the name translation placeholders do not match the name
+    _name_translation_placeholders_reported = False
 
     # Protect for multiple updates
     _update_staged = False
@@ -529,6 +551,7 @@ class Entity(
     _attr_state: StateType = STATE_UNKNOWN
     _attr_supported_features: int | None = None
     _attr_translation_key: str | None
+    _attr_translation_placeholders: Mapping[str, str]
     _attr_unique_id: str | None = None
     _attr_unit_of_measurement: str | None
 
@@ -620,6 +643,29 @@ class Entity(
             f".{self.translation_key}.name"
         )
 
+    def _substitute_name_placeholders(self, name: str) -> str:
+        """Substitute placeholders in entity name."""
+        try:
+            return name.format(**self.translation_placeholders)
+        except KeyError as err:
+            if not self._name_translation_placeholders_reported:
+                if get_release_channel() != "stable":
+                    raise HomeAssistantError("Missing placeholder %s" % err) from err
+                report_issue = self._suggest_report_issue()
+                _LOGGER.warning(
+                    (
+                        "Entity %s (%s) has translation placeholders '%s' which do not "
+                        "match the name '%s', please %s"
+                    ),
+                    self.entity_id,
+                    type(self),
+                    self.translation_placeholders,
+                    name,
+                    report_issue,
+                )
+                self._name_translation_placeholders_reported = True
+            return name
+
     def _name_internal(
         self,
         device_class_name: str | None,
@@ -635,7 +681,7 @@ class Entity(
         ):
             if TYPE_CHECKING:
                 assert isinstance(name, str)
-            return name
+            return self._substitute_name_placeholders(name)
         if hasattr(self, "entity_description"):
             description_name = self.entity_description.name
             if description_name is UNDEFINED and self._default_to_device_class_name():
@@ -845,6 +891,16 @@ class Entity(
             return self.entity_description.translation_key
         return None
 
+    @final
+    @cached_property
+    def translation_placeholders(self) -> Mapping[str, str]:
+        """Return the translation placeholders for translated entity's name."""
+        if hasattr(self, "_attr_translation_placeholders"):
+            return self._attr_translation_placeholders
+        if hasattr(self, "entity_description"):
+            return self.entity_description.translation_placeholders or {}
+        return {}
+
     # DO NOT OVERWRITE
     # These properties and methods are either managed by Home Assistant or they
     # are used to perform a very specific function. Overwriting these may
@@ -958,7 +1014,7 @@ class Entity(
             return name
 
         device_name = device_entry.name_by_user or device_entry.name
-        if self.use_device_name:
+        if name is None and self.use_device_name:
             return device_name
         return f"{device_name} {name}" if device_name else name
 
@@ -1107,8 +1163,7 @@ class Entity(
 
         if (
             self._context_set is not None
-            and hass.loop.time() - self._context_set
-            > CONTEXT_RECENT_TIME.total_seconds()
+            and hass.loop.time() - self._context_set > CONTEXT_RECENT_TIME_SECONDS
         ):
             self._context = None
             self._context_set = None
@@ -1468,7 +1523,12 @@ class Entity(
             self.async_on_remove(self._async_unsubscribe_device_updates)
 
     def __repr__(self) -> str:
-        """Return the representation."""
+        """Return the representation.
+
+        If the entity is not added to a platform it's not safe to call _stringify_state.
+        """
+        if self._platform_state != EntityPlatformState.ADDED:
+            return f"<entity unknown.unknown={STATE_UNKNOWN}>"
         return f"<entity {self.entity_id}={self._stringify_state(self.available)}>"
 
     async def async_request_call(self, coro: Coroutine[Any, Any, _T]) -> _T:
@@ -1491,12 +1551,42 @@ class Entity(
             self.hass, integration_domain=platform_name, module=type(self).__module__
         )
 
+    @callback
+    def _report_deprecated_supported_features_values(
+        self, replacement: IntFlag
+    ) -> None:
+        """Report deprecated supported features values."""
+        if self._deprecated_supported_features_reported is True:
+            return
+        self._deprecated_supported_features_reported = True
+        report_issue = self._suggest_report_issue()
+        report_issue += (
+            " and reference "
+            "https://developers.home-assistant.io/blog/2023/12/28/support-feature-magic-numbers-deprecation"
+        )
+        _LOGGER.warning(
+            (
+                "Entity %s (%s) is using deprecated supported features"
+                " values which will be removed in HA Core 2025.1. Instead it should use"
+                " %s, please %s"
+            ),
+            self.entity_id,
+            type(self),
+            repr(replacement),
+            report_issue,
+        )
+
 
 class ToggleEntityDescription(EntityDescription, frozen_or_thawed=True):
     """A class that describes toggle entities."""
 
 
-class ToggleEntity(Entity):
+TOGGLE_ENTITY_CACHED_PROPERTIES_WITH_ATTR_ = {"is_on"}
+
+
+class ToggleEntity(
+    Entity, cached_properties=TOGGLE_ENTITY_CACHED_PROPERTIES_WITH_ATTR_
+):
     """An abstract class for entities that can be turned on and off."""
 
     entity_description: ToggleEntityDescription
@@ -1511,7 +1601,7 @@ class ToggleEntity(Entity):
             return None
         return STATE_ON if is_on else STATE_OFF
 
-    @property
+    @cached_property
     def is_on(self) -> bool | None:
         """Return True if entity is on."""
         return self._attr_is_on
